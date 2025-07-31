@@ -35,3 +35,7 @@ python fixed_integrated_monitor.py
 ```
 
 The script loads `queries.xlsx` and begins sending requests while displaying real-time statistics. Logs and a JSON report are saved in a timestamped folder (e.g., `fixed-gpu-monitor-2023-01-01_12-00`).
+
+### Handling timeouts
+
+`fixed_integrated_monitor.py` now retries requests when a timeout occurs. You can adjust the number of attempts by editing `MAX_RETRIES` in the configuration dictionary near the top of the script.
