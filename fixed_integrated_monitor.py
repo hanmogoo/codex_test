@@ -35,7 +35,9 @@ class CompleteFixedGPUMonitor:
             'MIN_CONCURRENT': 5,
             
             # ⚡ 타이밍 최적화
-            'INITIAL_DELAY': 0.4,
+            # 초기에는 백엔드 안정성을 위해 0.4초 지연을 두었으나
+            # 현재는 불필요하여 0초로 설정
+            'INITIAL_DELAY': 0,
             'TIMEOUT': 10.0,
             'CONNECT_TIMEOUT': 3.0,
             'READ_TIMEOUT': 7.0,
@@ -57,11 +59,11 @@ class CompleteFixedGPUMonitor:
         }
         
         # 📊 성능 데이터
-        self.active_requests = {}
         self.completed_requests = deque(maxlen=10000)
         self.start_time = time.time()
         self.current_concurrent = self.config['INITIAL_CONCURRENT']
         self.last_adjustment = time.time()
+        self.semaphore = None
         
         # 📁 로그 설정
         self.setup_logging()
@@ -202,6 +204,9 @@ class CompleteFixedGPUMonitor:
         if old_concurrent != self.current_concurrent:
             self.logger.info(f"🔄 동시성 조정: {old_concurrent} → {self.current_concurrent}")
             self.logger.info(f"📊 성공률: {success_rate:.1f}%, QPS: {current_qps:.1f}")
+            if self.semaphore is not None:
+                # 세마포어 용량을 최신 동시성에 맞춰 재생성
+                self.semaphore = asyncio.Semaphore(self.current_concurrent)
         
         self.last_adjustment = current_time
 
@@ -367,11 +372,13 @@ class CompleteFixedGPUMonitor:
             headers={'User-Agent': 'FixedGPUMonitor/1.0'}
         ) as session:
             
-            # 동적 세마포어
-            semaphore = asyncio.Semaphore(self.current_concurrent)
-            
+            # 동적 세마포어␊
+            self.semaphore = asyncio.Semaphore(self.current_concurrent)
+
             async def process_query_with_semaphore(query: str, index: int):
                 async with semaphore:
+                    # 초기 지연(INITIAL_DELAY)은 서버 부하 분산을 위해 사용
+                    # 현재는 0으로 설정되어 바로 전송
                     await asyncio.sleep(self.config['INITIAL_DELAY'])
                     return await self.send_request(session, query, index)
             
