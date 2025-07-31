@@ -41,6 +41,7 @@ class CompleteFixedGPUMonitor:
             'TIMEOUT': 10.0,
             'CONNECT_TIMEOUT': 3.0,
             'READ_TIMEOUT': 7.0,
+            'MAX_RETRIES': 3,
             
             # 🌐 네트워크 최적화
             'MAX_CONNECTIONS': 200,
@@ -64,6 +65,7 @@ class CompleteFixedGPUMonitor:
         self.current_concurrent = self.config['INITIAL_CONCURRENT']
         self.last_adjustment = time.time()
         self.semaphore = None
+        self.active_requests = {}
         
         # 📁 로그 설정
         self.setup_logging()
@@ -257,90 +259,99 @@ class CompleteFixedGPUMonitor:
         monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
         monitor_thread.start()
 
-    async def send_request(self, session: aiohttp.ClientSession, 
+    async def send_request(self, session: aiohttp.ClientSession,
                           query: str, index: int) -> Dict[str, Any]:
         """개별 요청 전송"""
-        
+
         req_id = f"{index:04d}"
         start_time = time.time()
-        
+
         self.active_requests[req_id] = {
             'query': query,
             'start_time': start_time,
             'index': index
         }
-        
-        try:
-            request_body = self.create_correct_api_request(query, index)
-            
-            async with session.post(
-                self.config['API_URL'],
-                json=request_body,
-                timeout=aiohttp.ClientTimeout(
-                    total=self.config['TIMEOUT'],
-                    connect=self.config['CONNECT_TIMEOUT'],
-                    sock_read=self.config['READ_TIMEOUT']
-                )
-            ) as response:
-                response_time = time.time() - start_time
-                completion_time = time.time()
-                
-                if response.status == 200:
-                    try:
-                        response_data = await response.json()
-                        print(f"✅ 성공 [{index}]: {response_data}")
-                        result = {
-                            'index': index,
-                            'query': query,
-                            'success': True,
-                            'response_time': response_time,
-                            'completion_time': completion_time,
-                            'status': response.status
-                        }
-                    except Exception as e:
-                        print(f"💥 JSON 파싱 실패 [{index}] : {e}")
+        last_error = None
+        for attempt in range(1, self.config.get('MAX_RETRIES', 1) + 1):
+            try:
+                request_body = self.create_correct_api_request(query, index)
+
+                async with session.post(
+                    self.config['API_URL'],
+                    json=request_body,
+                    timeout=aiohttp.ClientTimeout(
+                        total=self.config['TIMEOUT'],
+                        connect=self.config['CONNECT_TIMEOUT'],
+                        sock_read=self.config['READ_TIMEOUT']
+                    )
+                ) as response:
+                    response_time = time.time() - start_time
+                    completion_time = time.time()
+
+                    if response.status == 200:
+                        try:
+                            response_data = await response.json()
+                            print(f"✅ 성공 [{index}]: {response_data}")
+                            result = {
+                                'index': index,
+                                'query': query,
+                                'success': True,
+                                'response_time': response_time,
+                                'completion_time': completion_time,
+                                'status': response.status
+                            }
+                        except Exception as e:
+                            print(f"💥 JSON 파싱 실패 [{index}] : {e}")
+                            result = {
+                                'index': index,
+                                'query': query,
+                                'success': False,
+                                'response_time': response_time,
+                                'completion_time': completion_time,
+                                'error': f"JSON 파싱 실패: {e}"
+                            }
+                    else:
+                        error_text = await response.text()
+                        print(f"💥 실패 [{index}] - HTTP {response.status} - 응답: {error_text[:200]}")
                         result = {
                             'index': index,
                             'query': query,
                             'success': False,
                             'response_time': response_time,
                             'completion_time': completion_time,
-                            'error': f"JSON 파싱 실패: {e}"
+                            'error': f"HTTP {response.status} - {error_text[:100]}"
                         }
-                else:
-                  error_text = await response.text()
-                  print(f"💥 실패 [{index}] - HTTP {response.status} - 응답: {error_text[:200]}")
-                  result = {
-                      'index': index,
-                      'query': query,
-                      'success': False,
-                      'response_time': response_time,
-                      'completion_time': completion_time,
-                      'error': f"HTTP {response.status} - {error_text[:100]}"
-                  }
-                
-                # 활성 요청 제거 및 완료 요청 추가
-                if req_id in self.active_requests:
-                    del self.active_requests[req_id]
-                self.completed_requests.append(result)
-                
-                return result            
-                
-        except Exception as e:
-            if req_id in self.active_requests:
-                del self.active_requests[req_id]
-            
-            result = {
-                'index': index,
-                'query': query,
-                'success': False,
-                'response_time': time.time() - start_time,
-                'completion_time': time.time(),
-                'error': str(e)
-            }
-            self.completed_requests.append(result)
-            return result
 
+                    if req_id in self.active_requests:
+                        del self.active_requests[req_id]
+                    self.completed_requests.append(result)
+
+                    return result
+
+            except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+                last_error = e
+                if attempt < self.config.get('MAX_RETRIES', 1):
+                    print(f"⏳ 타임아웃 [{index}] 재시도 {attempt}/{self.config['MAX_RETRIES']}")
+                    await asyncio.sleep(1)
+                    continue
+            except Exception as e:
+                last_error = e
+                break
+
+        if req_id in self.active_requests:
+            del self.active_requests[req_id]
+
+        result = {
+            'index': index,
+            'query': query,
+            'success': False,
+            'response_time': time.time() - start_time,
+            'completion_time': time.time(),
+            'error': str(last_error) if last_error else 'unknown'
+        }
+        self.completed_requests.append(result)
+        return result
+    
     async def run_fixed_test(self, queries: List[str]):
         """수정된 테스트 실행"""
         
@@ -372,15 +383,14 @@ class CompleteFixedGPUMonitor:
             headers={'User-Agent': 'FixedGPUMonitor/1.0'}
         ) as session:
             
-            # 동적 세마포어␊
+            # 동적 세마포어
             self.semaphore = asyncio.Semaphore(self.current_concurrent)
 
+
             async def process_query_with_semaphore(query: str, index: int):
-                async with semaphore:
-                    # 초기 지연(INITIAL_DELAY)은 서버 부하 분산을 위해 사용
-                    # 현재는 0으로 설정되어 바로 전송
-                    await asyncio.sleep(self.config['INITIAL_DELAY'])
-                    return await self.send_request(session, query, index)
+              async with self.semaphore:
+                  await asyncio.sleep(self.config['INITIAL_DELAY'])
+                  return await self.send_request(session, query, index)
             
             print(f"🔄 3초 후 시작...")
             await asyncio.sleep(3)
